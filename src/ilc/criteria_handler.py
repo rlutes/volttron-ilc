@@ -56,11 +56,10 @@ def register_criterion(name):
 
 
 class CriteriaCluster(object):
-    def __init__(self, priority, criteria_labels, row_average, cluster_config, logging_topic, parent):
+    def __init__(self, priority, criteria_weights, cluster_config, logging_topic, parent):
         self.criteria = {}
         self.priority = priority
-        self.criteria_labels = criteria_labels
-        self.row_average = row_average
+        self.weights, self.criteria_labels = self._process_criteria_weights(criteria_weights)
         global mappers
         try:
             mappers = cluster_config.pop("mappers")
@@ -69,6 +68,24 @@ class CriteriaCluster(object):
 
         for device_name, device_criteria in cluster_config.items():
             self.criteria[device_name] = DeviceCriteria(device_criteria, logging_topic, parent)
+
+    def _process_criteria_weights(self, criteria_weights: dict[str, dict[str, float]]):
+        """
+        Helper function to map control state and criteria weights for later use with AHP.
+        :param criteria_weights: A dictionary where each key represents a state and its associated
+        value is another dictionary containing criteria names as keys and their corresponding weights as values.
+        :type criteria_weights: dict
+        :return: A tuple containing two dictionaries - the first dictionary has state names as keys
+        and a list of criteria weights as values, and the second dictionary has state names as keys
+        and a list of criteria labels as values.
+        :rtype: tuple(dict, dict)
+        """
+        state_weights = {}
+        state_labels = {}
+        for state, values in criteria_weights.items():
+            state_weights[state] = list(values.values())
+            state_labels[state] = list(values.keys())
+        return state_weights, state_labels
 
     def get_all_evaluations(self, state):
         results = {}
@@ -101,12 +118,12 @@ class CriteriaContainer(object):
             if not evaluations:
                 continue
 
-            if state not in cluster.criteria_labels.keys() or state not in cluster.row_average.keys():
+            if state not in cluster.criteria_labels.keys() or state not in cluster.weights.keys():
                 _log.debug("Criteria - Not configured for current state: {}".format(state))
                 continue
-            _log.debug("EVAL: {} - {}".format(evaluations.values(), cluster.criteria_labels[state]))
+            _log.debug("Evaluation: {} - {}".format(evaluations.values(), cluster.criteria_labels[state]))
             input_arr = input_matrix(evaluations, cluster.criteria_labels[state])
-            scores = build_score(input_arr, cluster.row_average[state], cluster.priority)
+            scores = build_score(input_arr, cluster.weights[state], cluster.priority)
             all_scored.extend(scores)
 
             _log.debug('Input Array: ' + str(input_arr))

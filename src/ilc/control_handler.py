@@ -445,7 +445,7 @@ class ControlSetting(object):
             result = self.agent.vip.rpc.call(self.device_actuator, "revert_point", "ilc", self.point).get(timeout=30)
             _log.debug("Reverted point: {} - Result: {}".format(self.point, result))
         else:
-            self._actuate(release=True)
+            self._actuate(release=True, trigger=trigger)
 
     # @abc.abstractmethod
     # def _release(self, release=False):
@@ -614,7 +614,6 @@ class RampControlSetting(ControlSetting):
         self.destination_value = destination_value
         self.increment_time = increment_time
         self.increment_value = increment_value
-        _log.debug(f'######## IN RAMP INIT, CONTROL_VALUE IS: {self.control_value}')
         self.greenlet = None
 
     def get_control_info(self):

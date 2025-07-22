@@ -56,7 +56,7 @@ except PackageNotFoundError:
 
 from ilc.control_handler import ControlCluster, ControlContainer
 from ilc.criteria_handler import CriteriaContainer, CriteriaCluster
-from ilc.ilc_matrices import calc_column_sums, extract_criteria, normalize_matrix, validate_input
+from ilc.ilc_matrices import extract_criteria, fucom
 from ilc.utils import sympy_evaluate
 
 __version__ = "2.2.1"
@@ -365,16 +365,10 @@ class ILCAgent(Agent):
             cluster_actuator = cluster_config.get("cluster_actuator", "platform.actuator")
             # Check that all three parameters are not None
             if pairwise_criteria_config and criteria_config and control_config:
-                criteria_labels, criteria_array, self.load_control_modes = extract_criteria(pairwise_criteria_config)
-                col_sums = calc_column_sums(criteria_array)
-                row_average = normalize_matrix(criteria_array, col_sums)
-                _log.debug("VALIDATE - criteria_array {} - col_sums {}".format(criteria_array, col_sums))
-                if not validate_input(criteria_array, col_sums):
-                    _log.debug("Inconsistent pairwise configuration. Check "
-                               "configuration in: {}".format(pairwise_criteria_config))
-                    sys.exit()
+                pairwise_criteria_config = extract_criteria(pairwise_criteria_config)
+                criteria_weights = fucom(pairwise_criteria_config)
 
-                criteria_cluster = CriteriaCluster(cluster_priority, criteria_labels, row_average, criteria_config,
+                criteria_cluster = CriteriaCluster(cluster_priority, criteria_weights, criteria_config,
                                                    self.record_topic, self)
                 self.criteria_container.add_criteria_cluster(criteria_cluster)
                 _log.debug("CONTROL config: {}, ------------------- CRITERIA config: {}".format(control_config, criteria_config))

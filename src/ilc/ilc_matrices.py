@@ -23,11 +23,12 @@
 # }}}
 
 import logging
-import math
-import operator
+import numpy as np
+
+from collections import OrderedDict
+from scipy.optimize import linprog
 
 from collections import defaultdict
-from functools import reduce
 
 from importlib.metadata import distribution, PackageNotFoundError
 try:
@@ -43,138 +44,59 @@ logging.basicConfig(level=logging.DEBUG,
                     datefmt='%m-%d-%y %H:%M:%S')
 
 
-def extract_criteria(filename):
+def fucom(pairwise_comparisons: dict[str, dict[str, float]], out_debug_dict=None) -> dict[str: float]:
+    """
+    Takes a dictionary of ranked criteria and returns a dictionary with the optimal weights of these same criteria.
+        Criteria should be ranked on a scale from 1 to 10, relative to the most significant criterion.
+        Lower numbers represent greater significance than higher numbers.
+        The most significant criterion should be ranked 1.
+
+        An optional argument, out_debug_dict can be used as an output parameter to inspect the input used to linprog
+          within the function. Pass an empty dictionary to out_debug_dict, and it will contain the parameters passed
+          to linprog() once these are available (before linprog has run).
+    """
+    criteria_weights = {}
+    for state, ranked_criteria in pairwise_comparisons.items():
+        sorted_criteria = OrderedDict(sorted(ranked_criteria.items(), key=lambda item: item[1]))
+        criteria_count = len(sorted_criteria)
+        objective = [1] + [0]*criteria_count
+        lhs_ineq = np.zeros([2*criteria_count-3, criteria_count+1])
+        lhs_ineq[:,0] = -1  # First column represents the minimized variable.
+        criteria_values = list(sorted_criteria.values())
+        for c in range(criteria_count-1):
+            lhs_ineq[c, c+1] = 1
+            lhs_ineq[c, c+2] = -criteria_values[c+1] / criteria_values[c]
+        for c in range(criteria_count-2):
+            lhs_ineq[c+criteria_count-1, c+1] = 1
+            lhs_ineq[c+criteria_count-1, c+3] = -criteria_values[c+2]/criteria_values[c]
+        rhs_ineq = np.zeros([1, lhs_ineq.shape[0]])
+        lhs_eq = [[0] + [1]*criteria_count]
+        rhs_eq = [1]
+        bounds = [(0, float('inf'))] + [(0, 1)]*criteria_count
+        if isinstance(out_debug_dict, dict):
+            # Debug parameters is not returned, but is available to the caller if a dict was passed in.
+            out_debug_dict.update({"objective": objective, "lhs_ineq": lhs_ineq, "rhs_ineq": rhs_ineq,
+                                   "lhs_eq": lhs_eq, "rhs_eq": rhs_eq, "bounds": bounds})
+        result = linprog(c=objective, A_ub=lhs_ineq, b_ub=rhs_ineq, A_eq=lhs_eq, b_eq=rhs_eq,
+                         bounds=bounds, method='revised simplex')
+        weights = {k: float(result.x[i+1]) for i, k in enumerate(sorted_criteria.keys())}
+        criteria_weights[state] = weights
+    return criteria_weights
+
+
+def extract_criteria(pairwise_configuration: dict[str, dict[str, float]]) -> dict[str, dict[str, float]]:
     """
     Extract pairwise criteria parameters
-    :param filename:
+    :param pairwise_configuration:
     :return:
     """
-    criteria_labels = {}
-    criteria_matrix = {}
-    # config_matrix = load_config(filename)
-    config_matrix = filename
     # check if file has been updated or uses old format
-    _log.debug("CONFIG_MATRIX: {}".format(config_matrix))
-    if "curtail" not in config_matrix.keys() and "augment" not in config_matrix.keys():
-        config_matrix = {"curtail": config_matrix}
-
-    _log.debug("CONFIG_MATRIX: {}".format(config_matrix))
-    for state in config_matrix:
-        index_of = dict([(a, i) for i, a in enumerate(config_matrix[state].keys())])
-
-        criteria_labels[state] = []
-        for label, index in index_of.items():
-            criteria_labels[state].insert(index, label)
-
-        criteria_matrix[state] = [[0.0 for _ in config_matrix[state]] for _ in config_matrix[state]]
-        for j in config_matrix[state]:
-            row = index_of[j]
-            criteria_matrix[state][row][row] = 1.0
-
-            for k in config_matrix[state][j]:
-                col = index_of[k]
-                criteria_matrix[state][row][col] = float(config_matrix[state][j][k])
-                criteria_matrix[state][col][row] = float(1.0 / criteria_matrix[state][row][col])
-
-    return criteria_labels, criteria_matrix, list(config_matrix.keys())
-
-
-def calc_column_sums(criteria_matrix):
-    """
-    Calculate the column sums for the criteria matrix.
-    :param criteria_matrix:
-    :return:
-    """
-    cumsum = {}
-    for state in criteria_matrix:
-        j = 0
-        cumsum[state] = []
-        while j < len(criteria_matrix[state][0]):
-            col = [float(row[j]) for row in criteria_matrix[state]]
-            cumsum[state].append(sum(col))
-            j += 1
-    return cumsum
-
-
-def normalize_matrix(criteria_matrix, col_sums):
-    """
-    Normalizes the members of criteria matrix using the vector
-    col_sums. Returns sums of each row of the matrix.
-    :param criteria_matrix:
-    :param col_sums:
-    :return:
-    """
-    normalized_matrix = {}
-    row_sums = {}
-    for state in criteria_matrix:
-        normalized_matrix[state] = []
-        row_sums[state] = []
-        i = 0
-        while i < len(criteria_matrix[state]):
-            j = 0
-            norm_row = []
-            while j < len(criteria_matrix[state][0]):
-                norm_row.append(criteria_matrix[state][i][j]/(col_sums[state][j] if col_sums[state][j] != 0 else 1))
-                j += 1
-            row_sum = sum(norm_row)
-            norm_row.append(row_sum/j)
-            row_sums[state].append(row_sum/j)
-            normalized_matrix[state].append(norm_row)
-            i += 1
-    return row_sums
-
-
-def validate_input(pairwise_matrix, col_sums):
-    """
-    Validates the criteria matrix to ensure that the inputs are
-
-    internally consistent. Returns a True if the matrix is valid,
-    and False if it is not.
-    :param pairwise_matrix:
-    :param col_sums:
-    :return:
-    """
-    # Calculate row products and take the 5th root
-    _log.info("Validating matrix")
-    consistent = True
-    for state in pairwise_matrix:
-        random_index = [0, 0, 0, 0.58, 0.9, 1.12, 1.24, 1.32, 1.41, 1.45, 1.49]
-        roots = []
-        for row in pairwise_matrix[state]:
-            roots.append(math.pow(reduce(operator.mul, row, 1), 1.0/5))
-        # Sum the vector of products
-        root_sum = sum(roots)
-        # Calculate the priority vector
-        priority_vec = []
-        for item in roots:
-            priority_vec.append(item / root_sum)
-
-        # Calculate the priority row
-        priority_row = []
-        for i in range(0, len(col_sums[state])):
-            priority_row.append(col_sums[state][i] * priority_vec[i])
-
-        # Sum the priority row
-        priority_row_sum = sum(priority_row)
-
-        # Calculate the consistency index
-        ncols = max(len(col_sums[state]) - 1, 1)
-        consistency_index = \
-            (priority_row_sum - len(col_sums[state]))/ncols
-
-        # Calculate the consistency ratio
-        if len(col_sums[state]) < 4:
-            consistency_ratio = consistency_index
-        else:
-            rindex = random_index[len(col_sums[state])]
-            consistency_ratio = consistency_index / rindex
-
-        _log.debug("Pairwise comparison: {} - CR: {}".format(state, consistency_index))
-        if consistency_ratio > 0.2:
-            consistent = False
-            _log.debug("Inconsistent pairwise comparison: {} - CR: {}".format(state, consistency_ratio))
-
-    return consistent
+    _log.debug(f"Pairwise input data: {pairwise_configuration}")
+    if "curtail" not in pairwise_configuration.keys() and "augment" not in pairwise_configuration.keys():
+        config_matrix = {"curtail": pairwise_configuration}
+    else:
+        config_matrix = pairwise_configuration
+    return config_matrix
 
 
 def build_score(_matrix, weight, priority):
@@ -198,28 +120,46 @@ def build_score(_matrix, weight, priority):
     return zip(scores, input_keys)
 
 
-def input_matrix(builder, criteria_labels):
+def _verify_criteria_match(criteria_labels: list[str], device_criteria: list[str]) -> None:
     """
-    Construct input normalized input matrix.
-    :param builder:
-    :param criteria_labels:
-    :return:
+    Verifies that the input criteria labels match the data criteria.
     """
-    sum_mat = defaultdict(float)
-    inp_mat = {}
-    label_check = list(list(builder.values())[-1].keys())
-    if set(label_check) != set(criteria_labels):
-        raise Exception('Input criteria and data criteria do not match.')
-    for device_data in builder.values():
-        for k, v in device_data.items():
-            sum_mat[k] += v
-    for key in builder:
-        inp_mat[key] = mat_list = []
-        for tag in criteria_labels:
-            builder_value = builder[key][tag]
-            if builder_value:
-                mat_list.append(builder_value/sum_mat[tag])
-            else:
-                mat_list.append(0.0)
+    if set(device_criteria) != set(criteria_labels):
+        raise Exception("Input criteria and data criteria do not match")
 
-    return inp_mat
+
+def _normalize_values(builder: dict[str, dict[str, float]], sums_by_criteria: dict[str, float],
+                      criteria_labels: list[str]) -> dict[str, list[float]]:
+    """
+    Normalizes the input data values based on the sum of criteria.
+    """
+    normalized_matrix = {}
+    for key, device_data in builder.items():
+        normalized_matrix[key] = [
+            (device_data[tag] / sums_by_criteria[tag]) if device_data[tag] else 0.0
+            for tag in criteria_labels
+        ]
+    return normalized_matrix
+
+
+def input_matrix(device_data_builder: dict[str, dict[str, float]], criteria_labels: list[str]) -> dict[
+    str, list[float]]:
+    """
+    Constructs and returns a normalized input matrix from device data.
+
+    :param device_data_builder: Dictionary containing device data.
+    :param criteria_labels: List of criteria labels to use for the matrix.
+    :return: A dictionary representing the normalized input matrix.
+    """
+    # Validate criteria match
+    device_criteria = list(next(iter(device_data_builder.values())).keys())
+    _verify_criteria_match(criteria_labels, device_criteria)
+
+    # Compute sums for each criterion
+    sums_by_criteria = defaultdict(float)
+    for device_data in device_data_builder.values():
+        for criterion, value in device_data.items():
+            sums_by_criteria[criterion] += value
+
+    # Normalize values
+    return _normalize_values(device_data_builder, sums_by_criteria, criteria_labels)
