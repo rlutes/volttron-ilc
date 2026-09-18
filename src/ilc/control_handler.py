@@ -582,22 +582,21 @@ class ControlSetting(abc.ABC):
         load_point_values: List[Tuple[str, Any]] = []
 
         for load_arg in self.load["load_equation_args"]:
-            path = self.agent.base_rpc_path(path="")
-            point_to_get = load_arg[1]
+            path, point = load_arg[1].rsplit("/", 1)
             try:
                 value = self.agent.vip.rpc.call(self.device_actuator,
                                                 "get_point",
                                                 path,
-                                                point_to_get).get(timeout=30)
+                                                point).get(timeout=30)
             except (RemoteError, gevent.Timeout) as exc:
                 _log.warning(
                     "Failed to get point for load calculation %s: %s",
-                    point_to_get,
+                    '/'.join([path, point]),
                     exc,
                 )
                 self.control_load = 0.0
                 return
-            load_point_values.append((load_arg[0], value))
+            load_point_values.append((point, value))
 
         try:
             self.control_load = sympy_evaluate(load_equation, load_point_values)
