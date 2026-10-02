@@ -77,7 +77,7 @@ except PackageNotFoundError:
 # ---------------------------------------------------------------------------
 # Local
 # ---------------------------------------------------------------------------
-from ilc.control_handler import ControlCluster, ControlContainer
+from ilc.control_handler import ControlCluster, ControlContainer, ControlSetting
 from ilc.criteria_handler import CriteriaCluster, CriteriaContainer
 from ilc.ilc_matrices import (
     calc_column_sums,
@@ -1437,7 +1437,13 @@ class ILCAgent(Agent):
                 break
 
             control_manager = self.control_container.get_device((device_name, actuator))
-            control_setting = control_manager.get_control_setting(device_id, self.state)
+            # A device already under (dollar-mode) control is curtailed again
+            # through the same ControlSetting so every step is released from
+            # one place; re-resolving conditions could pick a sibling setting
+            # that would never be released.
+            control_setting = self._existing_setting(device_name, device_id)
+            if control_setting is None:
+                control_setting = control_manager.get_control_setting(device_id, self.state)
 
             if control_setting is None:
                 continue
@@ -1451,7 +1457,7 @@ class ILCAgent(Agent):
             )
 
             try:
-                error = control_setting.modify_load()
+                applied_load = control_setting.modify_load()
             except (RemoteError, gevent.Timeout) as exc:
                 _log.warning(
                     "Failed to set %s: %s",
@@ -1460,11 +1466,11 @@ class ILCAgent(Agent):
                 )
                 continue
 
-            if error:
+            if applied_load is None:
                 gevent.sleep(1)
                 continue
 
-            est_curtailed += control_setting.control_load
+            est_curtailed += applied_load
             control_manager.increment_control(device_id)
             _log.debug(f"Estimated load: {est_curtailed} -- Needed load: {need_curtailed}")
             if self._is_new_device(device_name, device_id):
@@ -1479,7 +1485,9 @@ class ILCAgent(Agent):
 
     def _filter_already_controlled(self, score_order: List[DeviceToken]) -> List[DeviceToken]:
         """
-        Remove devices already under non-dollar control.
+        Remove devices already under control, unless they may be curtailed
+        again: ``control_mode == "dollar"`` on a repeatable setting
+        (offset or equation).
 
         :param score_order: Candidate devices in priority order.
         :returns: Filtered candidate devices.
@@ -1487,9 +1495,31 @@ class ILCAgent(Agent):
         already = {
             (device.device_name, device.device_id, device.device_actuator)
             for device in self.devices
-            if device.control_mode != "dollar"
+            if not (device.control_mode == "dollar" and device.repeatable)
         }
         return [device for device in score_order if device not in already]
+
+    def _existing_setting(self, device_name: str, device_id: str) -> Optional[ControlSetting]:
+        """
+        Return the ControlSetting already controlling a device, if any.
+
+        :param device_name: Device name.
+        :param device_id: Device identifier.
+        :returns: The controlling setting, or ``None`` if the device is free.
+        """
+        for device in self.devices:
+            if device.device_name == device_name and device.device_id == device_id:
+                return device
+        return None
+
+    def _pending_release_count(self) -> int:
+        """
+        Total number of release actions outstanding across controlled devices.
+
+        Each dollar-mode curtailment pass is its own release unit, so this
+        can exceed the number of controlled devices.
+        """
+        return sum(device.pending_releases for device in self.devices)
 
     def _is_new_device(self, device_name: str, device_id: str) -> bool:
         """
@@ -1576,25 +1606,26 @@ class ILCAgent(Agent):
         :returns: ``None``
         """
         if not (self.stagger_release and self.devices):
-            self.device_group_size = [len(self.devices)]
+            self.device_group_size = [self._pending_release_count()]
             self.current_stagger = []
             return
 
-        num_devices = len(self.devices)
+        num_releases = self._pending_release_count()
         release_steps = max(
             1,
             math.floor(self.stagger_release_time / self.confirm_time + 1),
         )
 
         _log.debug(
-            "setup_release: devices=%d steps=%d stagger=%s confirm=%s",
-            num_devices,
+            "setup_release: devices=%d releases=%d steps=%d stagger=%s confirm=%s",
+            len(self.devices),
+            num_releases,
             release_steps,
             self.stagger_release_time,
             self.confirm_time,
         )
 
-        self.device_group_size = self._compute_group_sizes(num_devices, release_steps)
+        self.device_group_size = self._compute_group_sizes(num_releases, release_steps)
         self.current_stagger = self._compute_stagger_intervals(release_steps)
 
         _log.debug("Group sizes: %s", self.device_group_size)
@@ -1603,9 +1634,9 @@ class ILCAgent(Agent):
     @staticmethod
     def _compute_group_sizes(num_devices: int, steps: int) -> List[int]:
         """
-        Distribute devices across staggered release groups.
+        Distribute release units across staggered release groups.
 
-        :param num_devices: Number of controlled devices.
+        :param num_devices: Number of release units (one per curtailment step).
         :param steps: Number of staggered release steps.
         :returns: Group sizes per release step.
         """
@@ -1653,7 +1684,12 @@ class ILCAgent(Agent):
 
     def reset_devices(self) -> None:
         """
-        Release control of the next group of devices.
+        Release the next group of curtailment steps.
+
+        Each release unit undoes one control step on one device, working
+        through devices in release order.  A device with several dollar-mode
+        steps is stepped back one increment per unit and only leaves the
+        controlled set once every step has been released.
 
         :returns: ``None``
         """
@@ -1665,31 +1701,39 @@ class ILCAgent(Agent):
             if score == (device.device_name, device.device_id)
         ]
 
-        release_queue = controlled[::-1]
+        pending = controlled[::-1]
         release_count = self.device_group_size.pop(0) if self.device_group_size else 0
-        released_indices: List[int] = []
+        failed: List[ControlSetting] = []
 
-        for index in range(min(release_count, len(release_queue))):
-            device = release_queue[index]
+        while release_count > 0 and pending:
+            device = pending[0]
 
             if device.revert_priority is not None:
-                same_name = [d for d in self.devices if d.device_name == device.device_name]
+                same_name = [d for d in pending if d.device_name == device.device_name]
                 device = max(same_name, key=lambda item: item.revert_priority)
 
             try:
-                device.release()
+                fully_released = device.release()
+            except RemoteError as exc:
+                _log.warning("Failed to revert %s: %s", device.point, exc)
+                pending.remove(device)
+                failed.append(device)
+                continue
+
+            release_count -= 1
+            _log.debug(
+                "Released one step of %s; %d step(s) remain",
+                device.point,
+                device.pending_releases if not fully_released else 0,
+            )
+            if fully_released:
                 self.control_container.get_device(
                     (device.device_name, device.device_actuator)
                 ).reset_control_status(device.device_id)
                 device.clear_state()
-                released_indices.append(index)
-            except RemoteError as exc:
-                _log.warning("Failed to revert %s: %s", device.point, exc)
+                pending.remove(device)
 
-        remaining = [
-            device for index, device in enumerate(release_queue) if index not in released_indices
-        ]
-        self.devices = WeakSet(remaining)
+        self.devices = WeakSet(pending + failed)
 
         if self.current_stagger:
             minutes = self.current_stagger.pop(0)
@@ -1712,7 +1756,7 @@ class ILCAgent(Agent):
         :returns: ``None``
         """
         if self.devices:
-            self.device_group_size = [len(self.devices)]
+            self.device_group_size = [self._pending_release_count()]
             self.reset_devices()
 
         self.devices = WeakSet()
@@ -1773,7 +1817,7 @@ class ILCAgent(Agent):
         _log.info("Kill signal received — shutting down")
         self.kill_signal_received = True
         gevent.sleep(8)
-        self.device_group_size = [len(self.devices)]
+        self.device_group_size = [self._pending_release_count()]
         self.reset_devices()
         sys.exit()
 

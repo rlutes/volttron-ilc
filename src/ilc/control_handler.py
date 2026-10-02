@@ -43,7 +43,7 @@ from __future__ import annotations
 
 import abc
 import logging
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, List, NamedTuple, Optional, Set, Tuple, Union
 
 import gevent
 from importlib.metadata import distribution, PackageNotFoundError
@@ -194,9 +194,29 @@ class DeviceStatus:
             self.command_status = False
 
 
+class ControlStep(NamedTuple):
+    """
+    One successful control pass on a point.
+
+    :param previous: Point value read immediately before the pass.
+    :param applied: Value written by the pass.
+    :param time: Timestamp of the pass.
+    """
+    previous: float
+    applied: float
+    time: Any
+
+
 class ControlSetting(abc.ABC):
     """
     Abstract base for a single device-point control strategy.
+
+    Each successful :meth:`modify_load` pass is recorded as a
+    :class:`ControlStep`.  Settings whose ``repeatable`` attribute is
+    ``True`` (offset, equation) may be curtailed again on later passes when
+    ``control_mode == "dollar"``; every pass then adds a step, and
+    :meth:`release` undoes one step at a time so the agent can stagger the
+    release of individual curtailments rather than whole devices.
 
     Concrete subclasses must implement:
 
@@ -239,6 +259,9 @@ class ControlSetting(abc.ABC):
         If ``True``, a ``revert_point`` RPC follows a release actuation
         to fully cede control of the point.
     """
+    #: Whether repeated ``modify_load`` passes are meaningful for this strategy.
+    repeatable: bool = False
+
     def __init__(
         self,
         logging_topic: str,
@@ -302,7 +325,23 @@ class ControlSetting(abc.ABC):
         self.control_load: float = self.load
         self.control_time = None
         self.control_value: Optional[float] = None
-        self.revert_value: Optional[float] = None
+        self.current_value: Optional[float] = None
+        self.steps: List[ControlStep] = []
+
+    @property
+    def revert_value(self) -> Optional[float]:
+        """Point value read before the first control pass, or ``None``."""
+        return self.steps[0].previous if self.steps else None
+
+    @property
+    def pending_releases(self) -> int:
+        """
+        Number of release actions still required to fully cede the point.
+
+        A controlled setting always needs at least one release call, even if
+        no step was recorded (the release then falls back to ``revert_point``).
+        """
+        return max(1, len(self.steps))
 
     @property
     def device_id(self) -> str:
@@ -356,44 +395,77 @@ class ControlSetting(abc.ABC):
         self.control_load = self.load
         self.control_time = None
         self.control_value = None
-        self.revert_value = None
+        self.current_value = None
+        self.steps = []
 
-    def modify_load(self) -> bool:
+    def modify_load(self) -> Optional[float]:
         """
-        Execute the full control cycle: compute load, read the current
-        value, determine the new set-point, and actuate.
+        Execute one control pass: compute load, read the current value,
+        determine the new set-point, and actuate.
+
+        Repeat passes (``steps`` non-empty) that compute a set-point equal to
+        the live value, e.g. because min/max clamping has been reached, do
+        not actuate and report no load.
 
         :returns:
-            ``True`` if an error prevented actuation, ``False`` on success.
+            The load applied by this pass (``control_load``), ``0.0`` if the
+            pass was a no-op, or ``None`` if an error prevented actuation.
         """
         if isinstance(self.load, dict):
             self._evaluate_load_equation()
 
-        if not self._fetch_revert_value():
-            return True  # error flag
+        if not self._read_current_value():
+            return None
 
         self._determine_control_value()
-        self.control_time = get_aware_utc_now()
-        self._actuate()
-        return False
 
-    def release(self, trigger: bool = False) -> None:
+        if self.steps and self.control_value == self.current_value:
+            _log.debug(
+                "No-op pass for %s: value %s unchanged",
+                self.control_point_topic,
+                self.current_value,
+            )
+            return 0.0
+
+        self.control_time = get_aware_utc_now()
+        step = ControlStep(self.current_value, self.control_value, self.control_time)
+        self._actuate(step=step)
+        self.steps.append(step)
+        return self.control_load
+
+    def release(self, trigger: bool = False, full: bool = False) -> bool:
         """
-        Restore the device point to its pre-control value.
+        Undo the most recent control step, or every step at once.
 
         :param trigger:
             If ``True``, the release was caused by an external trigger
-            rather than a normal shed expiration.
+            rather than a normal shed expiration.  Trigger releases always
+            undo every step.
+        :param full:
+            If ``True``, restore the value read before the first step and
+            drop all recorded steps.
+        :returns:
+            ``True`` when no steps remain and the point is fully released.
         """
-        if self.revert_value is None:
+        if not self.steps:
             path, point = self.point.rsplit("/", 1)
             result = self.agent.vip.rpc.call(self.device_actuator,
                                              "revert_point",
                                              path,
                                              point).get(timeout=RPC_TIMEOUT)
             _log.debug("Reverted point: %s — Result: %s", self.point, result)
+            return True
+
+        if full or trigger:
+            step = ControlStep(self.steps[0].previous, self.steps[-1].applied,
+                               self.steps[-1].time)
+            self.steps = []
         else:
-            self._actuate(release=True, trigger=trigger)
+            step = self.steps.pop()
+
+        finalize = not self.steps
+        self._actuate(release=True, trigger=trigger, step=step, finalize=finalize)
+        return finalize
 
     @abc.abstractmethod
     def _determine_control_value(self) -> None:
@@ -410,17 +482,37 @@ class ControlSetting(abc.ABC):
         self.control_value = self._clamp(self.control_value)
 
     @abc.abstractmethod
-    def _actuate(self, release: bool = False, trigger: bool = False) -> None:
+    def _actuate(
+        self,
+        release: bool = False,
+        trigger: bool = False,
+        step: Optional[ControlStep] = None,
+        finalize: bool = True,
+    ) -> None:
         """
-        Send the computed control value (or the revert value) to the
+        Send the computed control value (or a step's previous value) to the
         actuator and publish a diagnostic record.
 
         :param release:
-            ``True`` when restoring the original value.
+            ``True`` when undoing a control step.
         :param trigger:
             ``True`` when the actuation is driven by a release trigger.
+        :param step:
+            The step being applied (``release=False``) or undone
+            (``release=True``).  When omitted on release, the first recorded
+            step is used.
+        :param finalize:
+            On release, whether this is the last step so the point may be
+            fully reverted when ``finalize_release_with_revert`` is set.
         """
-        target_value = self.revert_value if release else self.control_value
+        if release:
+            if step is None:
+                step = self.steps[0] if self.steps else ControlStep(None, None, None)
+            target_value = step.previous
+            previous_value = step.applied
+        else:
+            target_value = self.control_value
+            previous_value = step.previous if step is not None else self.current_value
         action_label = "Release" if release else "Actuate"
 
         try:
@@ -433,12 +525,12 @@ class ControlSetting(abc.ABC):
             prefix = self.agent.update_base_topic.split("/")[0]
             topic = "/".join([prefix, self.control_point_topic, action_label])
             message = {
-                "Value": self.control_value,
-                "PreviousValue": self.revert_value,
+                "Value": target_value,
+                "PreviousValue": previous_value,
             }
             self.agent.publish_record(topic, message)
 
-            if release and self.finalize_release_with_revert:
+            if release and finalize and self.finalize_release_with_revert:
                 path, point = self.point.rsplit("/", 1)
                 result = self.agent.vip.rpc.call(self.device_actuator,
                                                  "revert_point",
@@ -608,24 +700,25 @@ class ControlSetting(abc.ABC):
             )
             self.control_load = 0.0
 
-    def _fetch_revert_value(self) -> bool:
+    def _read_current_value(self) -> bool:
         """
-        Read and cache the current point value so we can revert later.
+        Read the live point value into ``current_value``.
+
+        The value read before the first pass becomes the revert value via
+        the first recorded :class:`ControlStep`.
 
         :returns: ``True`` on success, ``False`` on failure.
         """
-        if self.revert_value is not None:
-            return True
         try:
             path, point = self.control_point_topic.rsplit("/", 1)
-            self.revert_value = self.agent.vip.rpc.call(self.device_actuator,
-                                                        "get_point",
-                                                        path,
-                                                        point).get(timeout=RPC_TIMEOUT)
+            self.current_value = self.agent.vip.rpc.call(self.device_actuator,
+                                                         "get_point",
+                                                         path,
+                                                         point).get(timeout=RPC_TIMEOUT)
             return True
         except (RemoteError, gevent.Timeout) as exc:
             _log.warning(
-                "Failed to get revert value for %s: %s",
+                "Failed to read current value for %s: %s",
                 self.control_point_topic,
                 exc,
             )
@@ -656,6 +749,9 @@ class EquationControlSetting(ControlSetting):
     Determine the control value by evaluating a SymPy equation whose
     arguments are read from device points at control time.
 
+    Repeatable: each dollar-mode pass re-evaluates the equation against
+    live point values.
+
     :param default_device:
         Fallback device topic prefix (also forwarded to the base class).
     :param equation:
@@ -664,6 +760,8 @@ class EquationControlSetting(ControlSetting):
     :param kwargs:
         Remaining arguments forwarded to :class:`ControlSetting`.
     """
+
+    repeatable = True
 
     def __init__(self, default_device: str = "", equation: Optional[dict] = None, **kwargs) -> None:
         super().__init__(default_device=default_device, **kwargs)
@@ -723,19 +821,24 @@ class EquationControlSetting(ControlSetting):
         super()._determine_control_value()
 
     def _actuate(self, release: bool = False, **kwargs) -> None:
-        super()._actuate(release=release)
+        super()._actuate(release=release, **kwargs)
 
 
 class OffsetControlSetting(ControlSetting):
     """
     Determine the control value by adding a fixed offset to the
-    current (revert) value.
+    current (live) value.
+
+    Repeatable: each dollar-mode pass adds the offset again, so the
+    set-point compounds until ``minimum``/``maximum`` clamps it.
 
     :param offset:
         Signed numeric offset applied to the current point value.
     :param kwargs:
         Remaining arguments forwarded to :class:`ControlSetting`.
     """
+
+    repeatable = True
 
     def __init__(self, offset: float = 0.0, **kwargs) -> None:
         super().__init__(**kwargs)
@@ -748,12 +851,12 @@ class OffsetControlSetting(ControlSetting):
         return info
 
     def _determine_control_value(self) -> None:
-        """Add the offset to the stored revert value."""
-        self.control_value = self.revert_value + self.offset
+        """Add the offset to the live value read for this pass."""
+        self.control_value = self.current_value + self.offset
         super()._determine_control_value()
 
     def _actuate(self, release: bool = False, **kwargs) -> None:
-        super()._actuate(release=release)
+        super()._actuate(release=release, **kwargs)
 
 
 class RampControlSetting(ControlSetting):
@@ -822,17 +925,34 @@ class RampControlSetting(ControlSetting):
         self.control_value = self.destination_value
         super()._determine_control_value()
 
-    def _actuate(self, release: bool = False, trigger: bool = False) -> None:
+    def _actuate(
+        self,
+        release: bool = False,
+        trigger: bool = False,
+        step: Optional[ControlStep] = None,
+        finalize: bool = True,
+    ) -> None:
         """
         Spawn (or respawn) a greenlet that ramps to the target value.
 
         :param release:
-            If ``True``, ramp back to ``self.revert_value``.
+            If ``True``, ramp back to the step's previous value.
         :param trigger:
             If ``True``, the release was externally triggered — skip
             the stepping loop and jump straight to finalisation.
+        :param step:
+            The step being undone on release.  Ramp settings are not
+            repeatable so this is normally the only recorded step.
+        :param finalize:
+            On release, whether the point may be fully reverted when
+            ``finalize_release_with_revert`` is set.
         """
-        target_value = self.revert_value if release else self.control_value
+        if release:
+            if step is None:
+                step = self.steps[0] if self.steps else ControlStep(None, None, None)
+            target_value = step.previous
+        else:
+            target_value = self.control_value
         action_label = "Release" if release else "Actuate"
 
         try:
@@ -862,7 +982,7 @@ class RampControlSetting(ControlSetting):
             def _ramp_worker():
                 return self._run_ramp(
                     action_label, steps, sign, start_value, target_value,
-                    release, trigger,
+                    release, trigger, finalize,
                 )
 
             self._greenlet = gevent.spawn(_ramp_worker)
@@ -897,6 +1017,7 @@ class RampControlSetting(ControlSetting):
         target_value: float,
         release: bool,
         trigger: bool,
+        finalize: bool = True,
     ) -> Optional[float]:
         """
         Execute the full ramp sequence inside a spawned greenlet.
@@ -912,7 +1033,7 @@ class RampControlSetting(ControlSetting):
                 final = self._execute_ramp_steps(
                     action_label, steps, sign, start_value
                 )
-            if release and self.finalize_release_with_revert:
+            if release and finalize and self.finalize_release_with_revert:
                 path, point = self.point.rsplit("/", 1)
                 final = self.agent.vip.rpc.call(self.device_actuator,
                                                 "revert_point",
@@ -1002,7 +1123,7 @@ class ValueControlSetting(ControlSetting):
         super()._determine_control_value()
 
     def _actuate(self, release: bool = False, **kwargs) -> None:
-        super()._actuate(release=release)
+        super()._actuate(release=release, **kwargs)
 
 
 class Controls:
