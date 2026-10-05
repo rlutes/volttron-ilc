@@ -87,6 +87,19 @@ DEFAULT_ACTUATOR: str = "platform.driver"
 RPC_TIMEOUT: int = 30
 """Seconds to wait for an RPC response before raising ``gevent.Timeout``."""
 
+VALUE_TOLERANCE: float = 0.01
+"""
+Point-unit tolerance used when comparing a value read back from a device
+with a value previously written (floating point noise, e.g. 71.99998 vs 72).
+"""
+
+
+def _close(a: Optional[float], b: Optional[float]) -> bool:
+    """Return ``True`` if *a* and *b* are both numbers within :data:`VALUE_TOLERANCE`."""
+    if a is None or b is None:
+        return False
+    return abs(a - b) <= VALUE_TOLERANCE
+
 STATE_CURTAIL: str = "curtail"
 """Constant key representing the curtailment state."""
 
@@ -327,6 +340,8 @@ class ControlSetting(abc.ABC):
         self.control_value: Optional[float] = None
         self.current_value: Optional[float] = None
         self.steps: List[ControlStep] = []
+        #: Live value at which the BAS stopped honouring our writes, if detected.
+        self.limit_value: Optional[float] = None
 
     @property
     def revert_value(self) -> Optional[float]:
@@ -397,15 +412,18 @@ class ControlSetting(abc.ABC):
         self.control_value = None
         self.current_value = None
         self.steps = []
+        self.limit_value = None
 
     def modify_load(self) -> Optional[float]:
         """
         Execute one control pass: compute load, read the current value,
         determine the new set-point, and actuate.
 
-        Repeat passes (``steps`` non-empty) that compute a set-point equal to
-        the live value, e.g. because min/max clamping has been reached, do
-        not actuate and report no load.
+        Repeat passes (``steps`` non-empty) first check that the previous
+        write actually took effect (see :meth:`_last_step_took_effect`).  A
+        pass that finds the device pinned at a BAS limit, or that computes a
+        set-point equal to the live value because min/max clamping has been
+        reached, does not actuate and reports no load.
 
         :returns:
             The load applied by this pass (``control_load``), ``0.0`` if the
@@ -417,9 +435,28 @@ class ControlSetting(abc.ABC):
         if not self._read_current_value():
             return None
 
+        if self.steps and not self._last_step_took_effect():
+            return 0.0
+
+        if self.limit_value is not None:
+            if _close(self.current_value, self.limit_value):
+                _log.debug(
+                    "%s still pinned at BAS limit %s; skipping pass",
+                    self.control_point_topic,
+                    self.limit_value,
+                )
+                return 0.0
+            _log.info(
+                "%s moved from BAS limit %s to %s; resuming control",
+                self.control_point_topic,
+                self.limit_value,
+                self.current_value,
+            )
+            self.limit_value = None
+
         self._determine_control_value()
 
-        if self.steps and self.control_value == self.current_value:
+        if self.steps and _close(self.control_value, self.current_value):
             _log.debug(
                 "No-op pass for %s: value %s unchanged",
                 self.control_point_topic,
@@ -447,6 +484,8 @@ class ControlSetting(abc.ABC):
         :returns:
             ``True`` when no steps remain and the point is fully released.
         """
+        self.limit_value = None
+
         if not self.steps:
             path, point = self.point.rsplit("/", 1)
             result = self.agent.vip.rpc.call(self.device_actuator,
@@ -699,6 +738,66 @@ class ControlSetting(abc.ABC):
                 load_point_values,
             )
             self.control_load = 0.0
+
+    def _last_step_took_effect(self) -> bool:
+        """
+        Compare the live value with the most recent step to detect writes the
+        BAS silently ignored or clamped (a hidden set-point limit).
+
+        * Live value equals the step's applied value: the write took effect.
+        * Live value equals the step's previous value: the write was rejected.
+          The step is dropped (it never happened) and ``limit_value`` is set.
+        * Live value lies strictly between previous and applied: the BAS
+          clamped the write.  The step's applied value is corrected to what
+          was accepted and ``limit_value`` is set.
+        * Anything else is an external change; control proceeds normally.
+
+        :returns: ``False`` if a BAS limit was detected and this pass should
+            not actuate, ``True`` otherwise.
+        """
+        last = self.steps[-1]
+        current = self.current_value
+        if _close(current, last.applied):
+            return True
+
+        direction = last.applied - last.previous
+        if direction == 0:
+            return True
+
+        if _close(current, last.previous):
+            _log.warning(
+                "%s: set-point %s was not accepted by the BAS (value still %s); "
+                "treating %s as a BAS limit",
+                self.control_point_topic,
+                last.applied,
+                current,
+                current,
+            )
+            self.steps.pop()
+            self.limit_value = current
+            return False
+
+        progress = (current - last.previous) / direction
+        if 0.0 < progress < 1.0:
+            _log.warning(
+                "%s: set-point %s was clamped by the BAS to %s; "
+                "treating %s as a BAS limit",
+                self.control_point_topic,
+                last.applied,
+                current,
+                current,
+            )
+            self.steps[-1] = last._replace(applied=current)
+            self.limit_value = current
+            return False
+
+        _log.debug(
+            "%s changed externally from %s to %s since last pass",
+            self.control_point_topic,
+            last.applied,
+            current,
+        )
+        return True
 
     def _read_current_value(self) -> bool:
         """

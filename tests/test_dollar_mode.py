@@ -271,3 +271,100 @@ def test_filter_keeps_only_repeatable_dollar_devices():
     assert agent._filter_already_controlled(candidates) == [("vav1", "vav1", "platform.driver")]
     assert agent._existing_setting("vav1", "vav1") is dollar
     assert agent._existing_setting("vav9", "vav9") is None
+
+
+# --------------------------------------------------------------------------- #
+# Hidden BAS limit detection
+# --------------------------------------------------------------------------- #
+class LimitedActuator(FakeActuator):
+    """Actuator whose BAS silently rejects or clamps writes above a limit."""
+
+    def __init__(self, values, limit, clamp=False):
+        super().__init__(values)
+        self.limit = limit
+        self.clamp = clamp
+
+    def call(self, actuator, method, path, point, *args):
+        if method == "set_point" and args[0] > self.limit:
+            topic = f"{path}/{point}"
+            self.calls.append((method, topic) + args)
+            if self.clamp:
+                self.values[topic] = self.limit
+            result = MagicMock()
+            result.get.return_value = args[0]
+            return result
+        return super().call(actuator, method, path, point, *args)
+
+
+def test_rejected_write_is_detected_and_dropped():
+    topic = TOPIC.format("vav1")
+    actuator = LimitedActuator({topic: 70.0}, limit=72.0)
+    setting = make_offset(make_agent(actuator), "vav1", offset=1.0)
+
+    assert setting.modify_load() == 1.0          # 71 accepted
+    assert setting.modify_load() == 1.0          # 72 accepted
+    assert setting.modify_load() == 1.0          # 73 sent, silently ignored
+    assert actuator.values[topic] == 72.0
+    assert setting.pending_releases == 3
+
+    writes_before = len(actuator.sets(topic))
+    assert setting.modify_load() == 0.0, "pass after rejection must report no load"
+    assert len(actuator.sets(topic)) == writes_before, "and must not write again"
+    assert setting.steps[-1].applied == 72.0, "rejected step dropped"
+    assert setting.pending_releases == 2
+    assert setting.limit_value == 72.0
+
+    assert setting.modify_load() == 0.0, "still pinned: no-op"
+    assert len(actuator.sets(topic)) == writes_before
+
+    actuator.calls.clear()
+    assert setting.release() is False
+    assert setting.release() is True
+    assert actuator.sets(topic) == [71.0, 70.0]
+    assert setting.limit_value is None
+
+
+def test_clamped_write_corrects_step():
+    topic = TOPIC.format("vav1")
+    actuator = LimitedActuator({topic: 70.0}, limit=72.5, clamp=True)
+    setting = make_offset(make_agent(actuator), "vav1", offset=1.0)
+
+    for _ in range(3):
+        assert setting.modify_load() == 1.0      # 71, 72, 73 -> BAS holds 72.5
+    assert actuator.values[topic] == 72.5
+
+    assert setting.modify_load() == 0.0
+    assert setting.steps[-1] == setting.steps[-1]._replace(previous=72.0, applied=72.5)
+    assert setting.pending_releases == 3
+    assert setting.limit_value == 72.5
+
+    actuator.calls.clear()
+    assert [setting.release() for _ in range(3)] == [False, False, True]
+    assert actuator.sets(topic) == [72.0, 71.0, 70.0]
+
+
+def test_limit_clears_when_value_moves_away():
+    topic = TOPIC.format("vav1")
+    actuator = LimitedActuator({topic: 70.0}, limit=72.0)
+    setting = make_offset(make_agent(actuator), "vav1", offset=1.0)
+    for _ in range(3):
+        setting.modify_load()
+    assert setting.modify_load() == 0.0          # detects rejection of 73
+    assert setting.limit_value == 72.0
+
+    actuator.values[topic] = 68.0                # BAS schedule / occupant moves it
+    actuator.calls.clear()
+    assert setting.modify_load() == 1.0
+    assert actuator.sets(topic) == [69.0]
+    assert setting.limit_value is None
+
+
+def test_float_noise_within_tolerance_counts_as_took_effect():
+    topic = TOPIC.format("vav1")
+    actuator = FakeActuator({topic: 70.0})
+    setting = make_offset(make_agent(actuator), "vav1", offset=1.0)
+    assert setting.modify_load() == 1.0          # 71 written
+    actuator.values[topic] = 70.995              # BACnet real round-trip noise
+    assert setting.modify_load() == 1.0
+    assert actuator.sets(topic) == [71.0, 71.995]
+    assert setting.limit_value is None
